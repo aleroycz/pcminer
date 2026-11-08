@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# MicroMiner OS - PC share miner (lends hashing power to the phone).
+# Copyright (C) 2026 Vakea
+
+[package]
+name = "pcminer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "GPL-3.0-or-later"
+description = "MicroMiner PC worker: lends CPU/GPU hashing power to a paired phone over the LAN"
+
+[[bin]]
+name = "pcminer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# NaCl crypto_box is a faithful in-tree TweetNaCl port (src/nacl.rs) rather than a
+# crate dependency: it must be byte-for-byte interoperable with the device's
+# src/ota/tweetnacl.c, including NaCl's tag-prefixed secretbox layout, which the
+# RustCrypto `crypto_box` crate does not match. Only SHA-256 and an OS RNG are
+# pulled in from crates.
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+num_cpus = "1"
+ratatui = "0.28.1"
+crossterm = "0.28.1"
+
+# OpenCL GPU backend is optional: the default build is CPU-only so it compiles
+# and runs anywhere. Enable with `--features gpu` on a machine with an OpenCL
+# runtime to offload the sha256d sweep to the GPU.
+[dependencies.opencl3]
+version = "0.9"
+optional = true
+
+[features]
+default = []
+gpu = ["dep:opencl3"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
