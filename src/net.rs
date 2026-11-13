@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// MicroMiner OS - PC share miner: framed socket + encrypted session.
-// Copyright (C) 2026 Vakea
+// Length-prefixed MMSHARE1 TCP session; HELLO plaintext, then NaCl afternm frames.
 //
-// Wire format mirrors src/net/share_server.c exactly:
-//   * every frame is a 4-byte big-endian length prefix followed by that many
-//     payload bytes;
-//   * the handshake frames (HELLO / OK / DENY) are plaintext;
-//   * after the handshake every frame payload is `tag(16) || ciphertext`, sealed
-//     with NaCl crypto_box_afternm under the precomputed shared key and a
-//     per-direction, per-counter 24-byte nonce.
+// Copyright (C) 2026 Vakea
 
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
@@ -63,8 +56,8 @@ pub struct Session {
     pub device_pk: [u8; 32],
 }
 
-/// Distinguishes a read that timed out (so the caller can keep working) from a
-/// real connection error.
+/// Distinguishes a read that timed out (so the caller can keep working) from a real connection
+/// error.
 pub enum RecvOutcome {
     Msg(String),
     Timeout,
@@ -90,10 +83,7 @@ fn derive_base(tag: &[u8; 4], nc: &[u8; 24], ns: &[u8; 24]) -> [u8; 24] {
 }
 
 impl Session {
-    /// Perform the client handshake and return an established session.
-    ///
-    /// `connect_wait` bounds how long we block for the phone's reply, which may
-    /// include the user confirming the pairing modal on the device.
+    /// Client HELLO/OK handshake; `connect_wait` covers pairing UI on the phone.
     pub fn handshake(
         mut sock: TcpStream,
         my_pk: &[u8; 32],
@@ -173,8 +163,7 @@ impl Session {
         send_frame(&mut self.sock, &wire)
     }
 
-    /// Receive one decrypted message. A socket read timeout returns `Timeout`
-    /// rather than an error so the caller can push work and heartbeats.
+    /// Recv decrypt; socket timeout => `Timeout` for housekeeping without disconnect.
     pub fn recv(&mut self) -> Result<RecvOutcome> {
         let wire = match recv_frame(&mut self.sock) {
             Ok(w) => w,

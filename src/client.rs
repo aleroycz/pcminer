@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// MicroMiner OS - PC share miner: worker orchestration state machine.
-// Copyright (C) 2026 Vakea
+// Background worker: discover phone, MMSHARE1 session, JOB sweep, FOUND upstream.
 //
-// Runs on a background thread: find the phone, pair + handshake, then service
-// the encrypted work loop - receive JOB units, sweep them on the CPU, and send
-// FOUND nonces back for the phone to validate and submit. The phone is always
-// the master; this side never talks to the pool and never sees the wallet.
+// Copyright (C) 2026 Vakea
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,11 +15,32 @@ use crate::config::Config;
 use crate::discovery;
 use crate::miner::{self, Job, MiningHandle};
 use crate::net::{RecvOutcome, Session};
+use crate::nvidia_perf::NvidiaPerfGuard;
+use crate::proto::{self, SubmitResult};
+use crate::thermal::{ThermalBand, ThermalGuard};
 
 pub fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
     let my_pk = cfg.public_bytes();
     let my_sk = cfg.secret_bytes();
-    let threads = if cfg.threads == 0 { num_cpus::get() } else { cfg.threads };
+    // Leave one core for the TUI/OS when auto-sizing - saturating every core
+    // freezes the dashboard while hashing still "works".
+    let threads = if cfg.threads == 0 {
+        num_cpus::get().saturating_sub(1).max(1)
+    } else {
+        cfg.threads.max(1)
+    };
+    let prefer_gpu = cfg.use_gpu;
+    let unlock_gpu = cfg.unlock_gpu_perf && prefer_gpu;
+    let thermal_cfg = cfg.thermal.sanitized();
+
+    // Hold for process lifetime of the worker; restores clocks/PL on drop.
+    let mut _gpu_perf = if unlock_gpu {
+        let g = NvidiaPerfGuard::acquire();
+        set(&state, |s| s.log(g.summary().to_string()));
+        g
+    } else {
+        NvidiaPerfGuard::inactive()
+    };
 
     loop {
         if quit(&state) {
@@ -40,7 +57,9 @@ pub fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
         };
 
         // 2) Connect + handshake.
-        set(&state, |s| s.set_phase(Phase::Connecting, format!("connecting to {target}")));
+        set(&state, |s| {
+            s.set_phase(Phase::Connecting, format!("connecting to {target}"))
+        });
         let sock = match TcpStream::connect_timeout(&target, Duration::from_secs(8)) {
             Ok(s) => s,
             Err(e) => {
@@ -53,8 +72,19 @@ pub fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
             }
         };
 
-        set(&state, |s| s.set_phase(Phase::WaitingPair, "handshaking (confirm on phone if prompted)"));
-        let session = match Session::handshake(sock, &my_pk, &my_sk, &cfg.worker_name, Duration::from_secs(65)) {
+        set(&state, |s| {
+            s.set_phase(
+                Phase::WaitingPair,
+                "handshaking (confirm on phone if prompted)",
+            )
+        });
+        let session = match Session::handshake(
+            sock,
+            &my_pk,
+            &my_sk,
+            &cfg.worker_name,
+            Duration::from_secs(65),
+        ) {
             Ok(sess) => sess,
             Err(e) => {
                 set(&state, |s| {
@@ -71,12 +101,14 @@ pub fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
         set(&state, |s| {
             s.device_name = dev_name.clone();
             s.device_fp = dev_fp.clone();
-            s.set_phase(Phase::Mining, "connected");
+            // Paired, but do not look "mining" until a JOB arrives (never auto-arm).
+            s.armed = false;
+            s.set_phase(Phase::Idle, "paired; waiting for job");
             s.log(format!("paired with {dev_name} [{dev_fp}]"));
         });
 
         // 3) Service the work loop until the link drops.
-        work_loop(&state, session, threads);
+        work_loop(&state, session, threads, prefer_gpu, thermal_cfg.clone());
 
         if quit(&state) {
             return;
@@ -84,6 +116,7 @@ pub fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
         set(&state, |s| {
             s.armed = false;
             s.hashrate = 0.0;
+            s.backend = "—".into();
             s.set_phase(Phase::Idle, "disconnected - retrying");
             s.log("link closed; reconnecting");
         });
@@ -91,86 +124,288 @@ pub fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
     }
 }
 
-fn work_loop(state: &Arc<Mutex<AppState>>, mut session: Session, threads: usize) {
+fn work_loop(
+    state: &Arc<Mutex<AppState>>,
+    mut session: Session,
+    threads: usize,
+    prefer_gpu: bool,
+    thermal_cfg: crate::config::ThermalConfig,
+) {
     session.set_read_timeout(Some(Duration::from_millis(1000)));
 
-    let (found_tx, found_rx) = mpsc::channel::<(u32, u32)>();
+    let (found_tx, found_rx) = mpsc::channel::<(u32, u64)>();
     let hashes = Arc::new(AtomicU64::new(0));
     let mut mining: Option<MiningHandle> = None;
+    // Reconnect hygiene: refuse to hash until a JOB for this session; drain defensively even though
+    // the channel is fresh.
     let mut cur_tag: u32 = 0;
+    let mut cur_gen: u32 = 0;
+    let mut session_epoch: u32 = 0; // 0 = unset (legacy phone / CAPS not yet seen)
     let mut have_job = false;
+    let mut active_job: Option<Job> = None;
+    let mut next_sid: u32 = 1;
+    let mut pending_sid: Option<u32> = None;
 
     let mut cumulative: u64 = 0;
     let mut last_handle_hashes: u64 = 0;
     let mut last_rate_t = Instant::now();
     let mut last_stat = Instant::now();
     let mut paused_latch = false;
+    let mut thermal_paused = false;
+    let mut last_thermal_band = ThermalBand::Ok;
+    let mut backpressure = false; // WAIT from phone: slow the poll loop
+    let mut thermal = ThermalGuard::new(thermal_cfg);
+    let mut using_gpu = false;
+
+    flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
+
+    // CAPS negotiates algo; phone offers active algo, we accept sha256d or verushash.
+    let _ = session.send("CAPS ver=1 algo=sha256d");
+
+    {
+        let sample = thermal.tick(false);
+        set(state, |s| {
+            if thermal.enabled() && thermal.has_sensor() {
+                s.log(format!(
+                    "thermal guard on (NVIDIA) — pause when hot, power-cap when warm ({})",
+                    sample.note
+                ));
+            } else if thermal.enabled() {
+                s.log(sample.note);
+            }
+        });
+    }
 
     loop {
         if quit(state) {
             let _ = session.send("BYE");
+            flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
+            thermal.restore();
             return;
         }
 
-        let paused = get(state, |s| s.want_pause);
-        if paused != paused_latch {
-            paused_latch = paused;
-            if paused {
-                mining = None; // drop => cancel + join
+        // ---- thermal tick (safe pause / power-cap) ----------------------
+        {
+            let sample = thermal.tick(using_gpu || prefer_gpu);
+            set(state, |s| {
+                s.gpu_temp_c = sample.temp_c.unwrap_or(-1);
+                s.gpu_fan_pct = sample.fan_pct.map(|v| v as i32).unwrap_or(-1);
+                s.thermal_band = sample.band.label().into();
+            });
+            if sample.band != last_thermal_band {
+                set(state, |s| s.log(sample.note.clone()));
+                last_thermal_band = sample.band;
+            }
+
+            let want_thermal_pause = sample.band.must_pause();
+            if want_thermal_pause && !thermal_paused {
+                thermal_paused = true;
+                mining = None;
+                using_gpu = false;
                 set(state, |s| {
                     s.hashrate = 0.0;
+                    s.backend = "—".into();
+                    s.set_phase(
+                        Phase::Paused,
+                        format!("thermal cool-down (GPU {}°C)", sample.temp_c.unwrap_or(-1)),
+                    );
+                });
+            } else if !want_thermal_pause && thermal_paused {
+                thermal_paused = false;
+                // Resume the last job if the phone is still armed and operator isn't pausing.
+                let op_pause = get(state, |s| s.want_pause);
+                if !op_pause && have_job {
+                    if let Some(job) = active_job.clone() {
+                        set(state, |s| {
+                            s.set_phase(Phase::Mining, "resumed after cool-down");
+                            s.log("thermal clear — restarting sweep");
+                        });
+                        let handle =
+                            start_backend(job, threads, prefer_gpu, &found_tx, &hashes, state);
+                        using_gpu = get(state, |s| s.backend.starts_with('G'));
+                        mining = Some(handle);
+                    }
+                } else {
+                    set(state, |s| {
+                        s.set_phase(
+                            if s.armed { Phase::Idle } else { Phase::Idle },
+                            "cooled; waiting for work",
+                        );
+                    });
+                }
+            }
+        }
+
+        let paused = get(state, |s| s.want_pause) || thermal_paused;
+        if get(state, |s| s.want_pause) != paused_latch {
+            paused_latch = get(state, |s| s.want_pause);
+            if paused_latch {
+                mining = None; // drop => cancel (join is async)
+                using_gpu = false;
+                set(state, |s| {
+                    s.hashrate = 0.0;
+                    s.backend = "—".into();
                     s.set_phase(Phase::Paused, "paused by operator");
                     s.log("mining paused");
                 });
-            } else {
+            } else if !thermal_paused {
                 set(state, |s| {
                     s.set_phase(if s.armed { Phase::Mining } else { Phase::Idle }, "resumed");
                     s.log("mining resumed");
                 });
-                // A fresh JOB will restart the sweep; nothing to do here.
+                if have_job {
+                    if let Some(job) = active_job.clone() {
+                        let handle =
+                            start_backend(job, threads, prefer_gpu, &found_tx, &hashes, state);
+                        using_gpu = get(state, |s| s.backend.starts_with('G'));
+                        mining = Some(handle);
+                    }
+                }
             }
         }
 
-        // ---- receive one message (1s timeout) --------------------------
+        // ---- receive one message (1s timeout; longer under WAIT) -------
+        if backpressure {
+            session.set_read_timeout(Some(Duration::from_millis(2500)));
+        } else {
+            session.set_read_timeout(Some(Duration::from_millis(1000)));
+        }
+
         match session.recv() {
             Ok(RecvOutcome::Msg(msg)) => {
-                if let Some(job) = parse_job(&msg) {
-                    cur_tag = job.tag;
-                    have_job = true;
-                    set(state, |s| {
-                        s.armed = true;
-                        s.current_tag = job.tag;
-                        if !matches!(s.phase, Phase::Paused) {
-                            s.set_phase(Phase::Mining, "mining");
+                if let Some(job) = proto::parse_job(&msg) {
+                    if !accept_job(&job, session_epoch) {
+                        set(state, |s| {
+                            s.log(format!(
+                                "dropping stale/foreign JOB tag={} gen={} epoch={} (session epoch {session_epoch})",
+                                job.tag, job.gen, job.epoch
+                            ));
+                        });
+                    } else {
+                        if job.epoch != 0 {
+                            session_epoch = job.epoch;
                         }
-                    });
-                    if !paused {
-                        // Replace the running sweep with the new unit.
-                        last_handle_hashes = 0;
-                        hashes.store(0, Ordering::Relaxed);
-                        mining = Some(start_backend(job, threads, &found_tx, &hashes, state));
+                        cur_tag = job.tag;
+                        cur_gen = job.gen;
+                        have_job = true;
+                        active_job = Some(job.clone());
+                        backpressure = false;
+                        pending_sid = None;
+                        // Cancel prior sweep before starting the new one.
+                        flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
+                        using_gpu = false;
+                        let span = job.nend.saturating_sub(job.nstart).saturating_add(1);
+                        // Merkle root @ header[36..44) - must differ per PC (unique extranonce2).
+                        let merkle_fp = hex::encode(&job.header[36..44]);
+                        set(state, |s| {
+                            s.armed = true;
+                            s.current_tag = job.tag;
+                            if !matches!(s.phase, Phase::Paused) {
+                                s.set_phase(Phase::Mining, format!("mining gen={}", job.gen));
+                            }
+                            s.log(format!(
+                                "JOB tag={} gen={} merkle={}.. range={:08x}..{:08x} ({} nonces)",
+                                job.tag, job.gen, merkle_fp, job.nstart, job.nend, span
+                            ));
+                        });
+                        if !paused {
+                            let handle =
+                                start_backend(job, threads, prefer_gpu, &found_tx, &hashes, state);
+                            using_gpu = get(state, |s| s.backend.starts_with('G'));
+                            mining = Some(handle);
+                        }
                     }
                 } else if msg == "IDLE" {
                     have_job = false;
-                    mining = None;
+                    active_job = None;
+                    backpressure = false;
+                    pending_sid = None;
+                    flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
+                    using_gpu = false;
                     set(state, |s| {
                         s.armed = false;
                         s.hashrate = 0.0;
+                        s.backend = "—".into();
                         if !matches!(s.phase, Phase::Paused) {
                             s.set_phase(Phase::Idle, "phone idle (miner disarmed)");
                         }
+                    });
+                } else if msg == "WAIT" {
+                    // Armed on phone but no pool job: stop hashing, stay linked.
+                    have_job = false;
+                    active_job = None;
+                    backpressure = true;
+                    pending_sid = None;
+                    flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
+                    using_gpu = false;
+                    set(state, |s| {
+                        s.armed = false;
+                        s.hashrate = 0.0;
+                        s.backend = "—".into();
+                        if !matches!(s.phase, Phase::Paused) {
+                            s.set_phase(Phase::Idle, "waiting for pool job (backpressure)");
+                        }
+                        s.log("WAIT: phone has no pool job; hashing paused");
+                    });
+                } else if msg.starts_with("CAPS") {
+                    if let Some(ep) = proto::parse_caps_epoch(&msg) {
+                        session_epoch = ep;
+                    }
+                    if proto::caps_is_reject(&msg) {
+                        set(state, |s| {
+                            s.log(format!("CAPS rejected by phone: {msg}"));
+                            s.set_phase(Phase::Error, "algo not accepted by phone");
+                        });
+                        flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
+                        have_job = false;
+                    } else if let Some(algo) = proto::parse_caps_algo(&msg) {
+                        match proto::negotiate_algo(&algo) {
+                            Ok(ok) => {
+                                let _ = session.send(&format!("CAPS ver=1 algo={ok}"));
+                                set(state, |s| {
+                                    s.log(format!("CAPS ok algo={ok} epoch={session_epoch}"));
+                                });
+                            }
+                            Err(why) => {
+                                set(state, |s| {
+                                    s.log(format!("CAPS mismatch: {why}"));
+                                    s.set_phase(Phase::Error, why);
+                                });
+                                flush_inflight(
+                                    &mut mining,
+                                    &found_rx,
+                                    &hashes,
+                                    &mut last_handle_hashes,
+                                );
+                                have_job = false;
+                            }
+                        }
+                    }
+                } else if msg.starts_with("JOB ") {
+                    // parse_job already returned None (algo / shape reject).
+                    set(state, |s| {
+                        s.log(format!(
+                            "rejected JOB (unsupported algo or malformed): {}",
+                            msg.chars().take(96).collect::<String>()
+                        ));
                     });
                 } else if msg == "PING" {
                     let _ = session.send("PONG");
                 } else if msg == "PONG" {
                     // keepalive ack
                 } else if let Some(rest) = msg.strip_prefix("RESULT ") {
-                    record_result(state, rest.trim());
+                    // Prefer correlated parser; fall back to bare verdict.
+                    if let Some(r) = proto::parse_result(&format!("RESULT {rest}")) {
+                        apply_result(state, &r, &mut pending_sid);
+                    } else {
+                        record_verdict(state, rest.trim());
+                    }
                 }
             }
             Ok(RecvOutcome::Timeout) => { /* fall through to housekeeping */ }
             Err(e) => {
                 set(state, |s| s.log(format!("recv error: {e}")));
+                flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
                 return;
             }
         }
@@ -179,22 +414,36 @@ fn work_loop(state: &Arc<Mutex<AppState>>, mut session: Session, threads: usize)
         loop {
             match found_rx.try_recv() {
                 Ok((tag, nonce)) => {
-                    if have_job && tag == cur_tag {
-                        if session.send(&format!("FOUND {tag} {nonce:08x}")).is_err() {
-                            return;
-                        }
-                        set(state, |s| {
-                            s.found += 1;
-                            s.log(format!("found nonce {nonce:08x} (tag {tag}) -> phone"));
-                        });
+                    // Drop stale finds: wrong tag, or job already retracted.
+                    if !(have_job && tag == cur_tag) {
+                        continue;
                     }
+                    let sid = next_sid;
+                    next_sid = next_sid.wrapping_add(1).max(1);
+                    let width = active_job
+                        .as_ref()
+                        .map(|j| j.nonce_bytes.max(4) * 2)
+                        .unwrap_or(8);
+                    let nhex = format!("{nonce:0width$x}", width = width);
+                    let line = format!("FOUND {tag} {nhex} sid={sid}");
+                    if session.send(&line).is_err() {
+                        flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
+                        return;
+                    }
+                    pending_sid = Some(sid);
+                    set(state, |s| {
+                        s.found += 1;
+                        s.log(format!(
+                            "found nonce {nhex} (tag {tag} gen {cur_gen} sid {sid}) -> phone"
+                        ));
+                    });
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
 
-        // ---- hashrate bookkeeping --------------------------------------
+        // ---- hashrate bookkeeping + range-exhausted -> DONE --------------
         if let Some(h) = &mining {
             let cur = h.hashes();
             let delta = cur.saturating_sub(last_handle_hashes);
@@ -205,10 +454,24 @@ fn work_loop(state: &Arc<Mutex<AppState>>, mut session: Session, threads: usize)
                 let inst = delta as f64 / dt;
                 last_rate_t = Instant::now();
                 set(state, |s| {
-                    // Exponential smoothing for a steady readout.
-                    s.hashrate = if s.hashrate <= 0.0 { inst } else { s.hashrate * 0.6 + inst * 0.4 };
+                    s.hashrate = if s.hashrate <= 0.0 {
+                        inst
+                    } else {
+                        s.hashrate * 0.6 + inst * 0.4
+                    };
                     s.total_hashes = cumulative;
                 });
+            }
+            // Sweep thread finished its nstart..nend pass (hash counter stopped
+            // growing and joinable). Ask the phone for a fresh extranonce2 unit.
+            if have_job && !paused && delta == 0 && cur > 0 && h.finished() {
+                set(state, |s| {
+                    s.log("nonce range exhausted — requesting new work")
+                });
+                let _ = session.send("DONE");
+                flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
+                using_gpu = false;
+                // Keep have_job/active_job until phone sends the next JOB.
             }
         }
 
@@ -217,99 +480,177 @@ fn work_loop(state: &Arc<Mutex<AppState>>, mut session: Session, threads: usize)
             last_stat = Instant::now();
             let (th, rate) = get(state, |s| (s.total_hashes, s.hashrate));
             if session.send(&format!("STAT {th} {rate:.0}")).is_err() {
+                flush_inflight(&mut mining, &found_rx, &hashes, &mut last_handle_hashes);
                 return;
             }
         }
     }
 }
 
-/// Start a mining sweep for `job`. With the `gpu` feature we try the OpenCL
-/// backend first and fall back to the CPU backend on any initialisation error.
+/// Stop hashing and drain any in-flight FOUND notifications (reconnect / job change).
+fn flush_inflight(
+    mining: &mut Option<MiningHandle>,
+    found_rx: &std::sync::mpsc::Receiver<(u32, u64)>,
+    hashes: &Arc<AtomicU64>,
+    last_handle_hashes: &mut u64,
+) {
+    *mining = None; // cancel + join
+    while found_rx.try_recv().is_ok() {}
+    hashes.store(0, Ordering::Relaxed);
+    *last_handle_hashes = 0;
+}
+
+/// Accept a JOB only if its epoch matches this session (when both are set).
+fn accept_job(job: &Job, session_epoch: u32) -> bool {
+    if !proto::algo_supported(&job.algo) {
+        return false;
+    }
+    // epoch 0 on either side = legacy / not yet negotiated -> accept.
+    if job.epoch == 0 || session_epoch == 0 {
+        return true;
+    }
+    job.epoch == session_epoch
+}
+
+/// Prefer GPU when requested + built + sha256d; Verus is CPU-only.
 fn start_backend(
     job: Job,
     threads: usize,
-    found_tx: &Sender<(u32, u32)>,
+    prefer_gpu: bool,
+    found_tx: &Sender<(u32, u64)>,
     hashes: &Arc<AtomicU64>,
     state: &Arc<Mutex<AppState>>,
 ) -> MiningHandle {
+    let gpu_ok = prefer_gpu && (job.algo.is_empty() || job.algo == "sha256d");
+    if prefer_gpu && !gpu_ok {
+        set(state, |s| {
+            s.log(format!(
+                "algo={} is CPU-only (OpenCL is sha256d-only)",
+                job.algo
+            ));
+        });
+    }
     #[cfg(feature = "gpu")]
-    {
+    if gpu_ok {
         match crate::gpu::start(job.clone(), found_tx.clone(), hashes.clone()) {
             Ok(h) => {
-                set(state, |s| s.log("sweeping on GPU (OpenCL)"));
+                let label = crate::gpu::device_name().unwrap_or_else(|| "OpenCL GPU".into());
+                set(state, |s| {
+                    s.backend = "GPU".into();
+                    s.log(format!("sweeping on GPU ({label})"));
+                });
                 return h;
             }
             Err(e) => {
-                set(state, |s| s.log(format!("GPU unavailable ({e}); using CPU")));
+                let detail = crate::gpu::last_error().unwrap_or_default();
+                set(state, |s| {
+                    if detail.is_empty() {
+                        s.log(format!("GPU unavailable ({e}); using CPU"));
+                    } else {
+                        s.log(format!("GPU unavailable ({e} / {detail}); using CPU"));
+                    }
+                });
             }
         }
     }
-    let _ = state;
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_ok;
+
+    set(state, |s| {
+        s.backend = format!("CPU×{threads}");
+        s.log(format!(
+            "sweeping on CPU ({threads} threads) algo={}",
+            job.algo
+        ));
+    });
     miner::start(job, threads, found_tx.clone(), hashes.clone())
 }
 
-fn record_result(state: &Arc<Mutex<AppState>>, verdict: &str) {
+fn apply_result(state: &Arc<Mutex<AppState>>, r: &SubmitResult, pending_sid: &mut Option<u32>) {
+    if let (Some(ps), Some(sid)) = (*pending_sid, r.sid) {
+        if ps == sid {
+            *pending_sid = None;
+        }
+    }
+    record_verdict(state, &r.verdict);
+}
+
+fn record_verdict(state: &Arc<Mutex<AppState>>, verdict: &str) {
     set(state, |s| match verdict {
         "ok" => {
             s.accepted += 1;
-            s.log("share accepted by pool");
+            // Phone ACK after local verify + submit attempt - pool reply is separate.
+            s.log("share verified by phone (submitted to pool)");
         }
         "bad" => {
             s.rejected += 1;
-            s.log("share rejected (bad)");
+            s.log("share rejected (bad target/nonce)");
         }
         "stale" => {
             s.stale += 1;
             s.log("share stale");
         }
+        "nack" => {
+            s.rejected += 1;
+            s.log("share nack (duplicate or submit failed)");
+        }
         other => s.log(format!("result: {other}")),
     });
-}
-
-/// Parse "JOB <tag> <header76hex> <targethex> <nstart> <nend>".
-fn parse_job(msg: &str) -> Option<Job> {
-    let mut it = msg.split_whitespace();
-    if it.next()? != "JOB" {
-        return None;
-    }
-    let tag: u32 = it.next()?.parse().ok()?;
-    let hdr_hex = it.next()?;
-    let tgt_hex = it.next()?;
-    let nstart = u32::from_str_radix(it.next()?, 16).ok()?;
-    let nend = u32::from_str_radix(it.next()?, 16).ok()?;
-
-    let hdr_raw = hex::decode(hdr_hex).ok()?;
-    if hdr_raw.len() != 76 {
-        return None;
-    }
-    let mut header = [0u8; 76];
-    header.copy_from_slice(&hdr_raw);
-    let target = miner::parse_target(tgt_hex)?;
-    Some(Job { tag, header, target, nstart, nend })
 }
 
 fn resolve_target(state: &Arc<Mutex<AppState>>, cfg: &Config) -> Option<std::net::SocketAddr> {
     set(state, |s| s.want_rescan = false);
 
+    // Fixed host skips discovery entirely (most reliable on Windows Wi-Fi).
     if let Some(host) = &cfg.host {
-        set(state, |s| s.set_phase(Phase::Connecting, format!("using fixed host {host}")));
-        return host.to_socket_addrs().ok().and_then(|mut a| a.next());
+        set(state, |s| {
+            s.set_phase(Phase::Connecting, format!("using fixed host {host}"))
+        });
+        return host
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+            .or_else(|| {
+                set(state, |s| {
+                    s.set_phase(Phase::Error, format!("bad --host value: {host}"));
+                    s.log(format!("could not resolve host {host}"));
+                });
+                None
+            });
     }
 
-    set(state, |s| s.set_phase(Phase::Discovering, "searching the LAN for the phone"));
-    match discovery::discover(cfg.port, Duration::from_millis(1500)) {
+    set(state, |s| {
+        s.set_phase(
+            Phase::Discovering,
+            "searching the LAN for the phone (Developer → Allow PC mining)",
+        )
+    });
+    // Longer wait + subnet broadcasts; Windows often drops 255.255.255.255.
+    match discovery::discover(cfg.port, Duration::from_millis(2500)) {
         Ok(offers) if !offers.is_empty() => {
             let chosen = offers[0].clone();
             set(state, |s| {
                 if offers.len() > 1 {
-                    s.log(format!("{} phones found; using {}", offers.len(), chosen.name));
+                    s.log(format!(
+                        "{} phones found; using {}",
+                        offers.len(),
+                        chosen.name
+                    ));
                 }
-                s.set_phase(Phase::Connecting, format!("found {} at {}", chosen.name, chosen.addr));
+                s.set_phase(
+                    Phase::Connecting,
+                    format!("found {} at {}", chosen.name, chosen.addr),
+                );
             });
             Some(chosen.addr)
         }
         Ok(_) => {
-            set(state, |s| s.set_phase(Phase::Discovering, "no phone found yet - is sharing enabled on it?"));
+            set(state, |s| {
+                s.set_phase(
+                    Phase::Discovering,
+                    "no phone found — enable Allow PC mining, or pass --host ip:48510",
+                )
+            });
             None
         }
         Err(e) => {

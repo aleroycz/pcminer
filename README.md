@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# MicroMiner PC Worker (`pcminer`)
+# pcminer
 
-Lends this PC's hashing power to a paired phone over the LAN. **The phone is
-always the master**: it owns the pool connection and the wallet, builds every
-block header, validates every returned nonce, and submits every share under its
-own credentials. This tool is a pure nonce-sweeper — it never talks to the pool
-and never sees the wallet.
+A desktop worker that lends a PC's hashing power to a paired MicroMiner phone
+over the LAN. The phone stays in charge: it owns the pool connection and the
+wallet, builds every block header, checks every returned nonce and submits the
+shares. `pcminer` only sweeps nonce ranges; it never talks to the pool or sees
+the wallet.
 
 ## How it works
 
@@ -15,37 +15,37 @@ and never sees the wallet.
    │ pcminer │  TCP HELLO (x25519 pk) ───► │ share_server │
    │ (worker)│  ◄─── OK (device pk)  /DENY │  (master)    │
    │         │  ══ crypto_box channel ══   │              │
-   │         │  ◄── JOB (header+target)    │   owns pool  │
-   │  sweep  │  ─── FOUND (nonce) ───────► │  + wallet    │
-   └─────────┘  ◄── RESULT ok/bad/stale    └──────────────┘
+   │         │  ◄── JOB (+ gen/epoch/algo) │   owns pool  │
+   │  sweep  │  ─── FOUND (nonce,sid) ───► │  + wallet    │
+   └─────────┘  ◄── RESULT / WAIT / IDLE   └──────────────┘
 ```
 
-* **Discovery** — broadcasts `MMSHARE1 DISCOVER`; the phone answers with its
-  identity and TCP port, so you never type an IP (or pass `--host ip:port`).
-* **Pairing** — both sides have a long-term Curve25519 "box" identity. On first
-  connect the phone either shows a confirm/deny modal or (with auto-trust on)
-  pins this PC's key automatically. After that every frame is encrypted and
-  authenticated with NaCl `crypto_box` (XSalsa20-Poly1305).
-* **Work** — the phone sends a `JOB` (76-byte header prefix, 8-word target, a
-  nonce range) only while its miner is **armed** and the pool is connected. The
-  PC sweeps the range (double-SHA-256), returns any winning nonce, and the phone
-  re-validates and submits it. Nothing mines until the phone says so.
+* **Discovery.** The worker broadcasts `MMSHARE1 DISCOVER` and the phone
+  answers with its identity and TCP port. Use `--host ip:port` to skip this.
+* **Pairing.** Both sides have a long-term Curve25519 key. On first connect
+  the phone asks you to confirm the worker (or pins it automatically if
+  auto-trust is on). After that every frame is encrypted and authenticated
+  with NaCl `crypto_box` (XSalsa20-Poly1305).
+* **Work.** While its miner is armed and the pool has a job, the phone sends
+  `JOB` frames (76-byte header prefix, target, nonce range, `gen`/`epoch`/
+  `algo`). The worker returns winning nonces with a submit id and the phone
+  re-checks and submits them. `WAIT` and `IDLE` drop in-flight work. See
+  [`docs/net/PCMINER_SYNC.md`](../docs/net/PCMINER_SYNC.md).
 
-The crypto is a faithful in-tree port of the device's TweetNaCl
-(`src/nacl.rs`), verified byte-for-byte against standard known-answer vectors
-(X25519 RFC 7748, the canonical NaCl secretbox vector, Bitcoin-genesis
-sha256d) — see `cargo test`.
+The crypto in `src/nacl.rs` is a port of the TweetNaCl used on the device.
+`cargo test` checks it against the RFC 7748 X25519 vectors, the NaCl secretbox
+vector and the Bitcoin genesis block.
 
-## Build & run
+## Building
 
 ```sh
 cargo build --release
 ./target/release/pcminer            # interactive TUI; auto-discovers the phone
 ```
 
-First run generates a persistent identity at the path printed by
-`pcminer --print-id`. Confirm the pairing on the phone the first time (unless
-auto-trust is enabled on the device).
+The first run creates a persistent identity; `pcminer --print-id` shows its
+public key and where it is stored. Confirm the pairing on the phone the first
+time you connect.
 
 ### Options
 
@@ -61,31 +61,25 @@ auto-trust is enabled on the device).
 
 ### TUI keys
 
-`q` quit · `p` pause/resume · `r` rescan the LAN
+`q` quit, `p` pause/resume, `r` rescan the LAN.
 
-## GPU (OpenCL) backend — optional, needs on-hardware validation
+## GPU backend (OpenCL)
 
-A full OpenCL sha256d backend lives behind the `gpu` cargo feature
-(`src/gpu.rs` + `src/sha256d.cl`). Its kernel mirrors the CPU algorithm exactly
-and it falls back to the CPU backend automatically if a device can't be
+An OpenCL sha256d backend is available behind the `gpu` feature (`src/gpu.rs`,
+`src/sha256d.cl`). It falls back to the CPU backend if no device can be
 initialised.
 
 ```sh
 cargo build --release --features gpu
 ```
 
-Building with `--features gpu` requires an **OpenCL import library** for your
-linker (`OpenCL.lib` for MSVC, or `libOpenCL.a` for the GNU/mingw toolchain) —
-these ship with GPU vendor SDKs (NVIDIA CUDA, AMD, Intel) or the Khronos ICD
-loader. The Rust side compiles cleanly; only the final link needs that library.
-The GPU path has **not** been validated on real hardware yet — verify shares are
-accepted on a test pool before relying on it.
+Linking needs an OpenCL import library: `OpenCL.lib` for MSVC or `libOpenCL.a`
+for MinGW. They ship with the NVIDIA, AMD and Intel SDKs; a MinGW one is
+included under `third_party/opencl/`. The GPU path hasn't been tested much on
+real hardware, so check that shares are accepted on a test pool first.
 
-## Security notes
+## Security
 
-* The PC holds its own long-term secret key; the phone pins the matching public
-  key. A different key means a fresh pairing decision on the phone.
-* The PC cannot submit shares to the pool directly, cannot read the wallet, and
-  cannot arm the miner — all of that stays on the phone.
-* Work is only distributed while the phone's miner is armed; the device never
-  starts mining on its own.
+* The phone pins the worker's public key. A new key needs a new pairing.
+* A worker can't submit to the pool, read the wallet or arm the miner.
+* Work is only handed out while the phone's miner is armed.

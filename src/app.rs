@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // MicroMiner OS - PC share miner: shared UI/worker state.
+//
 // Copyright (C) 2026 Vakea
 
 use std::collections::VecDeque;
@@ -39,10 +40,10 @@ pub struct AppState {
     pub device_fp: String, // short fingerprint of the phone's pubkey
     pub my_fp: String,     // short fingerprint of this PC's pubkey
 
-    pub armed: bool,       // phone is handing out work (its miner is armed)
+    pub armed: bool, // phone is handing out work (its miner is armed)
     pub current_tag: u32,
 
-    pub hashrate: f64,     // H/s, smoothed
+    pub hashrate: f64, // H/s, smoothed
     pub total_hashes: u64,
 
     pub found: u64,
@@ -51,6 +52,14 @@ pub struct AppState {
     pub stale: u64,
 
     pub threads: usize,
+    /// "GPU" / "CPU" / "-" - what the active sweep is using.
+    pub backend: String,
+    /// Last GPU temp C (-1 = unknown).
+    pub gpu_temp_c: i32,
+    /// OEM-reported fan % (-1 = unknown / N/A).
+    pub gpu_fan_pct: i32,
+    /// Thermal band label: ok / warm / hot / critical.
+    pub thermal_band: String,
     pub log: VecDeque<String>,
 
     // control flags set by the UI, read by the worker
@@ -78,6 +87,10 @@ impl AppState {
             rejected: 0,
             stale: 0,
             threads,
+            backend: "—".into(),
+            gpu_temp_c: -1,
+            gpu_fan_pct: -1,
+            thermal_band: "ok".into(),
             log: VecDeque::with_capacity(256),
             want_quit: false,
             want_pause: false,

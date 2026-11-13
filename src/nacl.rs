@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// MicroMiner OS - PC share miner: NaCl crypto_box (TweetNaCl port).
+// TweetNaCl crypto_box subset for MMSHARE1; wire layout matches src/ota/tweetnacl.c.
+//
 // Copyright (C) 2026 Vakea
-//
-// A faithful, self-contained port of the crypto_box subset of TweetNaCl
-// (Bernstein et al., public domain). The device side (src/ota/tweetnacl.c) is
-// the exact same algorithm, so keys, nonces, the X25519 shared secret, the
-// HSalsa20 key-derivation (beforenm) and the XSalsa20-Poly1305 secretbox wire
-// format (16-byte tag FIRST, then ciphertext) all interoperate byte-for-byte.
-//
-// Only the pieces the share protocol needs are ported: scalar multiplication,
-// the Salsa/HSalsa core, the XSalsa20 stream, Poly1305, secretbox (seal/open),
-// beforenm/afternm, and keypair generation. Signing (Ed25519/SHA-512) is not.
 
 #![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_memcpy)] /* TweetNaCl port: keep loop form faithful to C */
 
 type Gf = [i64; 16];
 
@@ -196,9 +188,7 @@ fn crypto_stream_xsalsa20(c: &mut [u8], d: u64, n: &[u8], k: &[u8; 32]) {
 
 // ---- Poly1305 ----------------------------------------------------------
 
-const MINUSP: [u32; 17] = [
-    5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 252,
-];
+const MINUSP: [u32; 17] = [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 252];
 
 fn add1305(h: &mut [u32; 17], c: &[u32; 17]) {
     let mut u: u32 = 0;
@@ -244,7 +234,11 @@ fn crypto_onetimeauth(out: &mut [u8], m: &[u8], mut n: u64, k: &[u8]) {
         for i in 0..17 {
             x[i] = 0;
             for jj in 0..17 {
-                let rr = if jj <= i { r[i - jj] } else { 320u32.wrapping_mul(r[i + 17 - jj]) };
+                let rr = if jj <= i {
+                    r[i - jj]
+                } else {
+                    320u32.wrapping_mul(r[i + 17 - jj])
+                };
                 x[i] = x[i].wrapping_add(h[jj].wrapping_mul(rr));
             }
         }
@@ -296,8 +290,7 @@ fn crypto_onetimeauth_verify(h: &[u8], m: &[u8], n: u64, k: &[u8]) -> i32 {
 
 // ---- secretbox (XSalsa20-Poly1305) -------------------------------------
 
-/// NaCl crypto_secretbox: `m` has ZEROBYTES(32) leading zeros; on success `c`
-/// has BOXZEROBYTES(16) leading zeros, then the 16-byte tag, then ciphertext.
+/// secretbox seal: ZEROBYTES plaintext in; BOXZEROBYTES + tag + ciphertext out.
 fn crypto_secretbox(c: &mut [u8], m: &[u8], d: u64, n: &[u8], k: &[u8; 32]) -> i32 {
     if d < 32 {
         return -1;
@@ -314,8 +307,7 @@ fn crypto_secretbox(c: &mut [u8], m: &[u8], d: u64, n: &[u8], k: &[u8; 32]) -> i
     0
 }
 
-/// NaCl crypto_secretbox_open: `c` has BOXZEROBYTES(16) leading zeros, then tag,
-/// then ciphertext; on success `m` has ZEROBYTES(32) leading zeros then plaintext.
+/// secretbox open: authenticated decrypt back to ZEROBYTES-padded plaintext.
 fn crypto_secretbox_open(m: &mut [u8], c: &[u8], d: u64, n: &[u8], k: &[u8; 32]) -> i32 {
     if d < 32 {
         return -1;
@@ -345,7 +337,7 @@ fn car25519(o: &mut Gf) {
         if i < 15 {
             o[i + 1] += c - 1;
         } else {
-            // o[0] += (c-1) + 37*(c-1) == 38*(c-1)  (the 2^256 ≡ 38 reduction)
+            // o[0] += (c-1) + 37*(c-1) == 38*(c-1)  (the 2^256 == 38 reduction)
             o[0] += 38 * (c - 1);
         }
         o[i] -= c << 16;
@@ -532,8 +524,7 @@ pub fn box_beforenm(their_pk: &[u8; 32], my_sk: &[u8; 32]) -> [u8; 32] {
     k
 }
 
-/// Seal `plaintext` under the precomputed key `k` and 24-byte `nonce`.
-/// Returns the on-wire bytes: 16-byte Poly1305 tag followed by ciphertext.
+/// afternm seal: wire format is 16-byte Poly1305 tag then ciphertext.
 pub fn box_afternm_seal(k: &[u8; 32], nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
     let d = ZEROBYTES + plaintext.len();
     let mut m = vec![0u8; d];
@@ -544,8 +535,7 @@ pub fn box_afternm_seal(k: &[u8; 32], nonce: &[u8; 24], plaintext: &[u8]) -> Vec
     c[BOXZEROBYTES..].to_vec()
 }
 
-/// Open a wire frame (`tag || ciphertext`) under key `k` and 24-byte `nonce`.
-/// Returns the plaintext, or None on authentication failure.
+/// afternm open: None on Poly1305 failure.
 pub fn box_afternm_open(k: &[u8; 32], nonce: &[u8; 24], wire: &[u8]) -> Option<Vec<u8>> {
     if wire.len() < MACBYTES {
         return None;
@@ -573,12 +563,9 @@ mod tests {
     // X25519 RFC 7748 test vector.
     #[test]
     fn x25519_rfc7748() {
-        let scalar =
-            hex_to("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
-        let point =
-            hex_to("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
-        let expect =
-            hex_to("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+        let scalar = hex_to("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+        let point = hex_to("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
+        let expect = hex_to("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
         let mut out = [0u8; 32];
         crypto_scalarmult(&mut out, &scalar, &point);
         assert_eq!(&out[..], &expect[..]);
@@ -604,13 +591,7 @@ mod tests {
         assert!(box_afternm_open(&kb, &nonce, &bad).is_none());
     }
 
-    // Canonical NaCl secretbox known-answer vector (Bernstein's "Bob" message).
-    // Sealing the 131-byte plaintext under `firstkey` and the 24-byte `nonce`
-    // must reproduce the iconic ciphertext (16-byte Poly1305 tag f3ffc770...
-    // followed by the XSalsa20 ciphertext 8e993b9f...). This pins the Salsa20
-    // stream, the HSalsa20 core, Poly1305, and the tag-first wire layout to the
-    // exact standard the device's tweetnacl.c implements - independent of our
-    // own seal/open round-trip.
+    // NaCl secretbox KAT ("Bob" message) pins tag-first layout vs tweetnacl.c.
     #[test]
     fn secretbox_nacl_kat() {
         let firstkey: [u8; 32] = [

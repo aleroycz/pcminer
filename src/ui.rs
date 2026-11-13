@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// MicroMiner OS - PC share miner: ratatui dashboard.
-// Copyright (C) 2026 Vakea
+// ratatui dashboard: status, pairing, telemetry tiles, event log.
 //
-// A clean instrument-panel layout: a status header, the pairing/connection
-// identity, a row of telemetry tiles, and a live event log. Honest labels, no
-// decoration for its own sake.
+// Copyright (C) 2026 Vakea
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -46,17 +43,25 @@ fn phase_style(p: &Phase) -> Style {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, s: &AppState) {
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(MUTED));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let line = Line::from(vec![
-        Span::styled("  MicroMiner ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  MicroMiner ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("· PC Worker", Style::default().fg(Color::White)),
         Span::raw("    "),
         Span::styled(format!("[ {} ]", s.phase.label()), phase_style(&s.phase)),
         Span::raw("  "),
-        Span::styled(truncate(&s.status_detail, inner.width.saturating_sub(40) as usize), Style::default().fg(MUTED)),
+        Span::styled(
+            truncate(&s.status_detail, inner.width.saturating_sub(40) as usize),
+            Style::default().fg(MUTED),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), inner);
 }
@@ -75,7 +80,12 @@ fn draw_identity(f: &mut Frame, area: Rect, s: &AppState) {
         format!("{}  [{}]", s.device_name, s.device_fp)
     };
     let armed = if s.armed {
-        Span::styled("armed", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        Span::styled(
+            "armed",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::styled("disarmed", Style::default().fg(Color::Gray))
     };
@@ -90,7 +100,21 @@ fn draw_identity(f: &mut Frame, area: Rect, s: &AppState) {
         ]),
         Line::from(vec![
             Span::styled("  this PC  ", Style::default().fg(MUTED)),
-            Span::styled(format!("worker key [{}]", s.my_fp), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("worker key [{}]", s.my_fp),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw("   "),
+            Span::styled("cpu lanes ", Style::default().fg(MUTED)),
+            Span::styled(s.threads.to_string(), Style::default().fg(Color::White)),
+            Span::raw("   "),
+            Span::styled(
+                {
+                    let up = s.started.elapsed().as_secs();
+                    format!("up {:02}:{:02}:{:02}", up / 3600, (up / 60) % 60, up % 60)
+                },
+                Style::default().fg(MUTED),
+            ),
         ]),
     ];
     f.render_widget(Paragraph::new(lines), inner);
@@ -107,11 +131,14 @@ fn draw_tiles(f: &mut Frame, area: Rect, s: &AppState) {
         ])
         .split(area);
 
-    let up = s.started.elapsed().as_secs();
-    let uptime = format!("{:02}:{:02}:{:02}", up / 3600, (up / 60) % 60, up % 60);
-
-    tile(f, cols[0], "hashrate", &fmt_hashrate(s.hashrate), Color::Green);
-    tile(f, cols[1], "threads", &s.threads.to_string(), ACCENT);
+    tile(
+        f,
+        cols[0],
+        "hashrate",
+        &fmt_hashrate(s.hashrate),
+        Color::Green,
+    );
+    tile(f, cols[1], "backend", &s.backend, ACCENT);
     tile(
         f,
         cols[2],
@@ -119,7 +146,22 @@ fn draw_tiles(f: &mut Frame, area: Rect, s: &AppState) {
         &format!("{} / {}", s.accepted, s.found),
         Color::Green,
     );
-    tile(f, cols[3], "uptime", &uptime, Color::White);
+    let temp = if s.gpu_temp_c >= 0 {
+        let fan = if s.gpu_fan_pct >= 0 {
+            format!(" {}%fan", s.gpu_fan_pct)
+        } else {
+            String::new()
+        };
+        format!("{}°C {}{}", s.gpu_temp_c, s.thermal_band, fan)
+    } else {
+        format!("— ({})", s.thermal_band)
+    };
+    let temp_color = match s.thermal_band.as_str() {
+        "critical" | "hot" => Color::Red,
+        "warm" => Color::Yellow,
+        _ => Color::White,
+    };
+    tile(f, cols[3], "gpu temp", &temp, temp_color);
 
     // Second visual line inside the tiles area is handled by each tile's body.
     let _ = s.rejected;
@@ -128,7 +170,9 @@ fn draw_tiles(f: &mut Frame, area: Rect, s: &AppState) {
 }
 
 fn tile(f: &mut Frame, area: Rect, label: &str, value: &str, value_color: Color) {
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(MUTED));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -139,7 +183,9 @@ fn tile(f: &mut Frame, area: Rect, label: &str, value: &str, value_color: Color)
         )),
         Line::from(Span::styled(
             format!(" {value}"),
-            Style::default().fg(value_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(value_color)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
     f.render_widget(Paragraph::new(lines), inner);
@@ -159,18 +205,32 @@ fn draw_log(f: &mut Frame, area: Rect, s: &AppState) {
         .log
         .iter()
         .skip(start)
-        .map(|l| Line::from(Span::styled(format!(" {l}"), Style::default().fg(Color::Gray))))
+        .map(|l| {
+            Line::from(Span::styled(
+                format!(" {l}"),
+                Style::default().fg(Color::Gray),
+            ))
+        })
         .collect();
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn draw_footer(f: &mut Frame, area: Rect) {
     let line = Line::from(vec![
-        Span::styled("  q", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  q",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" quit   ", Style::default().fg(MUTED)),
-        Span::styled("p", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "p",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" pause/resume   ", Style::default().fg(MUTED)),
-        Span::styled("r", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "r",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" rescan LAN", Style::default().fg(MUTED)),
     ]);
     f.render_widget(Paragraph::new(line), area);

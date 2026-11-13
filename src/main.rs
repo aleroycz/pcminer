@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// MicroMiner OS - PC share miner.
-// Copyright (C) 2026 Vakea
+// PC share miner binary: pairs to phone over MMSHARE1; phone owns pool/wallet/submit.
 //
-// Lends this PC's hashing power to a paired phone over the LAN. The phone is
-// always the master: it owns the pool connection and the wallet, validates
-// every nonce, and submits every share. This tool only sweeps nonce ranges the
-// phone hands out. Run it, confirm the pairing on the phone the first time, and
-// it mines whatever the phone is working on - and only while the phone's miner
-// is armed.
+// Copyright (C) 2026 Vakea
 
 mod app;
 mod client;
@@ -19,11 +13,16 @@ mod gpu;
 mod miner;
 mod nacl;
 mod net;
+mod nvidia_perf;
+mod proto;
+mod thermal;
 mod ui;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use std::io::stdout;
@@ -65,6 +64,10 @@ fn main() -> Result<()> {
                     cfg.threads = n;
                 }
             }
+            "--gpu" => cfg.use_gpu = true,
+            "--cpu" => cfg.use_gpu = false,
+            "--unlock-gpu" => cfg.unlock_gpu_perf = true,
+            "--no-unlock-gpu" => cfg.unlock_gpu_perf = false,
             "--port" => {
                 i += 1;
                 if let Some(p) = args.get(i).and_then(|v| v.parse::<u16>().ok()) {
@@ -86,10 +89,25 @@ fn main() -> Result<()> {
         i += 1;
     }
 
-    let threads = if cfg.threads == 0 { num_cpus::get() } else { cfg.threads };
+    let threads = if cfg.threads == 0 {
+        num_cpus::get().saturating_sub(1).max(1)
+    } else {
+        cfg.threads.max(1)
+    };
     let my_fp = short_fp(&cfg.public_hex());
     let state = Arc::new(Mutex::new(AppState::new(my_fp, threads)));
-    state.lock().unwrap().log("pcminer started - the phone is the master");
+    {
+        let mut s = state.lock().unwrap();
+        s.log("pcminer started - the phone is the master");
+        #[cfg(feature = "gpu")]
+        if cfg.use_gpu {
+            s.log("GPU preferred (OpenCL); CPU fallback keeps one core free for UI");
+        } else {
+            s.log("CPU-only mode (--cpu); one core reserved for UI when threads=auto");
+        }
+        #[cfg(not(feature = "gpu"))]
+        s.log("built without gpu feature — CPU only");
+    }
 
     // Background worker: discovery, pairing, and the mining loop.
     let worker_state = state.clone();
@@ -123,40 +141,43 @@ fn run_tui(state: &Arc<Mutex<AppState>>) -> Result<()> {
 
 fn tui_loop<B: Backend>(state: &Arc<Mutex<AppState>>, terminal: &mut Terminal<B>) -> Result<()> {
     loop {
-        {
-            let s = state.lock().unwrap();
+        // try_lock: never stall the frame loop behind a worker log/update.
+        if let Ok(s) = state.try_lock() {
             terminal.draw(|f| ui::draw(f, &s))?;
         }
 
-        if event::poll(Duration::from_millis(120))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                let mut s = state.lock().unwrap();
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        s.want_quit = true;
-                        return Ok(());
+                if let Ok(mut s) = state.try_lock() {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            s.want_quit = true;
+                            return Ok(());
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            s.want_quit = true;
+                            return Ok(());
+                        }
+                        KeyCode::Char('p') => {
+                            s.want_pause = !s.want_pause;
+                        }
+                        KeyCode::Char('r') => {
+                            s.want_rescan = true;
+                            s.log("manual LAN rescan requested");
+                        }
+                        _ => {}
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        s.want_quit = true;
-                        return Ok(());
-                    }
-                    KeyCode::Char('p') => {
-                        s.want_pause = !s.want_pause;
-                    }
-                    KeyCode::Char('r') => {
-                        s.want_rescan = true;
-                        s.log("manual LAN rescan requested");
-                    }
-                    _ => {}
                 }
             }
         }
 
-        if state.lock().unwrap().want_quit {
-            return Ok(());
+        if let Ok(s) = state.try_lock() {
+            if s.want_quit {
+                return Ok(());
+            }
         }
     }
 }
@@ -216,8 +237,14 @@ fn print_help() {
          OPTIONS:\n\
          \x20   --host <ip:port>   Connect to a fixed phone address (skip discovery)\n\
          \x20   --name <name>      Worker name shown on the phone's pairing modal\n\
-         \x20   --threads <n>      CPU mining threads (0 = all cores)\n\
+         \x20   --threads <n>      CPU mining threads (0 = all cores minus one)\n\
+         \x20   --gpu              Prefer OpenCL GPU (default when built with gpu)\n\
+         \x20   --cpu              Force CPU backend (still leaves one core free if auto)\n\
+         \x20   --unlock-gpu       Raise NVIDIA PL/clocks to driver max (default on)\n\
+         \x20   --no-unlock-gpu    Leave NVIDIA clocks/power alone\n\
          \x20   --port <port>      Share port (default 48510)\n\
+         \x20   Thermal (NVIDIA): auto pause when hot, power-cap when warm; OEM fans\n\
+         \x20                     follow load. Tunables in pcminer.toml [thermal].\n\
          \x20   --print-id         Print this worker's public key and exit\n\
          \x20   --save             Persist the given options to the config and exit\n\
          \x20   --headless         Run without the TUI (status lines only)\n\

@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// MicroMiner OS - PC share miner: OpenCL sha256d search kernel.
+// MicroMiner OS - PC share miner: OpenCL sha256d search kernel (midstate).
 // Copyright (C) 2026 Vakea
 //
-// One work item per nonce. Builds the 80-byte block header (76-byte prefix +
-// 4-byte little-endian nonce), double-SHA-256s it, and keeps the nonce if the
-// hash meets the target. The comparison mirrors the CPU path and the device:
-// the 32-byte hash is read as 8 little-endian u32 words, compared from the most
-// significant word (index 7) down.
+// Host precomputes SHA-256 midstate over header bytes 0..63. Each work item
+// only runs the second 512-bit block (bytes 64..79 + pad) + the final SHA-256
+// of the 32-byte digest, then compares against the LE target (MSW first).
 
 __constant uint K[64] = {
     0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
@@ -45,28 +43,6 @@ static void transform(uint state[8], const uint w_in[16]) {
     state[4]+=e; state[5]+=f; state[6]+=g; state[7]+=h;
 }
 
-// SHA-256 of the 80-byte header: block 1 is header words 0..15 (big-endian),
-// block 2 is words 16..19 + the 0x80 pad + a 640-bit length. `hdr_be` holds the
-// 20 big-endian message words (19 from the prefix + the nonce word).
-static void sha256_80(const uint hdr_be[20], uint out[8]) {
-    uint state[8] = {
-        0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
-        0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u
-    };
-    uint w[16];
-    for (int i = 0; i < 16; i++) w[i] = hdr_be[i];
-    transform(state, w);
-
-    w[0]=hdr_be[16]; w[1]=hdr_be[17]; w[2]=hdr_be[18]; w[3]=hdr_be[19];
-    w[4]=0x80000000u;
-    for (int i = 5; i < 15; i++) w[i]=0;
-    w[15]=640u; // 80 bytes * 8
-    transform(state, w);
-
-    for (int i = 0; i < 8; i++) out[i]=state[i];
-}
-
-// SHA-256 of a 32-byte message (the first digest), one padded block.
 static void sha256_32(const uint in_be[8], uint out[8]) {
     uint state[8] = {
         0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
@@ -76,7 +52,7 @@ static void sha256_32(const uint in_be[8], uint out[8]) {
     for (int i = 0; i < 8; i++) w[i]=in_be[i];
     w[8]=0x80000000u;
     for (int i = 9; i < 15; i++) w[i]=0;
-    w[15]=256u; // 32 bytes * 8
+    w[15]=256u;
     transform(state, w);
     for (int i = 0; i < 8; i++) out[i]=state[i];
 }
@@ -85,36 +61,43 @@ static uint bswap32(uint x) {
     return (x >> 24) | ((x >> 8) & 0x0000ff00u) | ((x << 8) & 0x00ff0000u) | (x << 24);
 }
 
-__kernel void search(__global const uint *hdr_le, // 19 little-endian header words
-                     __global const uint *target, // 8 little-endian target words
+/*
+ * midstate: 8 BE SHA-256 state words after header[0..63]
+ * tail_be:  3 BE words = header bytes 64..75 (ntime || nbits high)
+ * nonce is appended as LE-in-header / BE-in-SHA word (bswap32)
+ */
+__kernel void search(__global const uint *midstate,
+                     __global const uint *tail_be,
+                     __global const uint *target,
                      const uint nstart,
-                     __global uint *out)           // [0]=count, [1..]=found nonces
+                     __global uint *out)
 {
     uint gid = get_global_id(0);
     uint nonce = nstart + gid;
 
-    // Build the 20 big-endian SHA message words. The host hands us the header as
-    // little-endian words (bytes as stored); SHA reads big-endian, so byteswap.
-    uint hdr_be[20];
-    for (int i = 0; i < 19; i++) hdr_be[i] = bswap32(hdr_le[i]);
-    hdr_be[19] = bswap32(nonce); // nonce is stored little-endian at bytes 76..79
+    uint state[8];
+    for (int i = 0; i < 8; i++) state[i] = midstate[i];
 
-    uint d1[8], d2[8];
-    sha256_80(hdr_be, d1);
-    sha256_32(d1, d2);
+    uint w[16];
+    w[0] = tail_be[0];
+    w[1] = tail_be[1];
+    w[2] = tail_be[2];
+    w[3] = bswap32(nonce);
+    w[4] = 0x80000000u;
+    for (int i = 5; i < 15; i++) w[i] = 0;
+    w[15] = 640u;
+    transform(state, w);
 
-    // d2 holds 8 big-endian state words; the hash bytes are d2 in big-endian.
-    // The device reads those bytes as little-endian u32 words: word[i] =
-    // bswap32(d2[i]). Compare MSW (index 7) down.
+    uint d2[8];
+    sha256_32(state, d2);
+
     for (int i = 7; i >= 0; i--) {
         uint hw = bswap32(d2[i]);
         uint tw = target[i];
-        if (hw < tw) { break; }       // meets target
-        if (hw > tw) { return; }      // misses
-        // equal: keep comparing the next word down
+        if (hw < tw) break;
+        if (hw > tw) return;
     }
 
-    // Winner: append the nonce (slot 0 is the count).
     uint idx = atomic_inc(&out[0]);
     if (idx < 256u) {
         out[1 + idx] = nonce;
